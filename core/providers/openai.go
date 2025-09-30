@@ -154,27 +154,49 @@ func (provider *OpenAIProvider) ChatCompletion(ctx context.Context, model string
 
 	responseBody := resp.Body()
 
-	// Pre-allocate response structs from pools
-	// response := acquireOpenAIResponse()
-	// defer releaseOpenAIResponse(response)
-	response := &schemas.BifrostResponse{}
-
-	// Use enhanced response handler with pre-allocated response
-	rawResponse, bifrostErr := handleProviderResponse(responseBody, response, provider.sendBackRawResponse)
-	if bifrostErr != nil {
-		return nil, bifrostErr
+	// Parse and preprocess reasoning fields
+	var rawMap map[string]interface{}
+	if err := sonic.Unmarshal(responseBody, &rawMap); err != nil {
+		return nil, newBifrostOperationError(schemas.ErrProviderResponseUnmarshal, err, providerName)
 	}
 
-	// Set raw response if enabled
+	// Map reasoning_content/reasoning to thought in message
+	if choices, ok := rawMap["choices"].([]interface{}); ok {
+		for _, choice := range choices {
+			if choiceMap, ok := choice.(map[string]interface{}); ok {
+				if message, ok := choiceMap["message"].(map[string]interface{}); ok {
+					if rc, exists := message["reasoning_content"]; exists {
+						message["thought"] = rc
+						delete(message, "reasoning_content")
+					} else if r, exists := message["reasoning"]; exists {
+						message["thought"] = r
+						delete(message, "reasoning")
+					}
+				}
+			}
+		}
+	}
+
+	// Re-marshal and parse into BifrostResponse
+	modifiedBody, err := sonic.Marshal(rawMap)
+	if err != nil {
+		return nil, newBifrostOperationError(schemas.ErrProviderJSONMarshaling, err, providerName)
+	}
+
+	response := &schemas.BifrostResponse{}
+	if err := sonic.Unmarshal(modifiedBody, response); err != nil {
+		return nil, newBifrostOperationError(schemas.ErrProviderResponseUnmarshal, err, providerName)
+	}
+
+	response.ExtraFields.Provider = providerName
+
 	if provider.sendBackRawResponse {
-		response.ExtraFields.RawResponse = rawResponse
+		response.ExtraFields.RawResponse = rawMap
 	}
 
 	if params != nil {
 		response.ExtraFields.Params = *params
 	}
-
-	response.ExtraFields.Provider = providerName
 
 	return response, nil
 }
@@ -472,15 +494,15 @@ func handleOpenAIStreaming(
 				continue
 			}
 
-			// First, check if this is an error response
-			var errorCheck map[string]interface{}
-			if err := sonic.Unmarshal([]byte(jsonData), &errorCheck); err != nil {
+			// Parse as raw map to check for errors and preprocess reasoning fields
+			var rawChunk map[string]interface{}
+			if err := sonic.Unmarshal([]byte(jsonData), &rawChunk); err != nil {
 				logger.Warn(fmt.Sprintf("Failed to parse stream data as JSON: %v", err))
 				continue
 			}
 
 			// Handle error responses
-			if _, hasError := errorCheck["error"]; hasError {
+			if _, hasError := rawChunk["error"]; hasError {
 				bifrostErr, err := parseOpenAIErrorForStreamDataLine(jsonData)
 				if err != nil {
 					logger.Warn(fmt.Sprintf("Failed to parse error response: %v", err))
@@ -489,6 +511,27 @@ func handleOpenAIStreaming(
 				ctx = context.WithValue(ctx, schemas.BifrostContextKeyStreamEndIndicator, true)
 				processAndSendBifrostError(ctx, postHookRunner, bifrostErr, responseChan, logger)
 				return
+			}
+
+			// Map reasoning_content/reasoning to thought in delta for reasoning models
+			if choices, ok := rawChunk["choices"].([]interface{}); ok {
+				for _, choice := range choices {
+					if choiceMap, ok := choice.(map[string]interface{}); ok {
+						if delta, ok := choiceMap["delta"].(map[string]interface{}); ok {
+							if rc, exists := delta["reasoning_content"]; exists {
+								delta["thought"] = rc
+								delete(delta, "reasoning_content")
+							} else if r, exists := delta["reasoning"]; exists {
+								delta["thought"] = r
+								delete(delta, "reasoning")
+							}
+						}
+					}
+				}
+				// Re-marshal the modified data
+				if modifiedJSON, err := sonic.Marshal(rawChunk); err == nil {
+					jsonData = string(modifiedJSON)
+				}
 			}
 
 			// Parse into bifrost response

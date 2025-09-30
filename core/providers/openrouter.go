@@ -256,10 +256,8 @@ func (provider *OpenRouterProvider) ChatCompletion(ctx context.Context, model st
 
 	responseBody := resp.Body()
 
-	response := &schemas.BifrostResponse{}
-
-	// Use enhanced response handler with pre-allocated response
-	rawResponse, bifrostErr := handleProviderResponse(responseBody, response, provider.sendBackRawResponse)
+	// Parse and preprocess reasoning fields
+	rawMap, response, bifrostErr := parseResponseWithReasoningFields(responseBody, schemas.OpenRouter)
 	if bifrostErr != nil {
 		return nil, bifrostErr
 	}
@@ -267,7 +265,7 @@ func (provider *OpenRouterProvider) ChatCompletion(ctx context.Context, model st
 	response.ExtraFields.Provider = schemas.OpenRouter
 
 	if provider.sendBackRawResponse {
-		response.ExtraFields.RawResponse = rawResponse
+		response.ExtraFields.RawResponse = rawMap
 	}
 
 	if params != nil {
@@ -279,7 +277,7 @@ func (provider *OpenRouterProvider) ChatCompletion(ctx context.Context, model st
 
 // ChatCompletionStream performs a streaming chat completion request to the OpenRouter API.
 // It supports real-time streaming of responses using Server-Sent Events (SSE).
-// Uses OpenRouter's OpenAI-compatible streaming format.
+// Uses OpenRouter's OpenAI-compatible streaming format with reasoning field support.
 // Returns a channel containing BifrostResponse objects representing the stream or an error if the request fails.
 func (provider *OpenRouterProvider) ChatCompletionStream(ctx context.Context, postHookRunner schemas.PostHookRunner, model string, key schemas.Key, messages []schemas.BifrostMessage, params *schemas.ModelParameters) (chan *schemas.BifrostStream, *schemas.BifrostError) {
 	formattedMessages, preparedParams := prepareOpenAIChatRequest(messages, params)
@@ -298,7 +296,7 @@ func (provider *OpenRouterProvider) ChatCompletionStream(ctx context.Context, po
 		"Cache-Control": "no-cache",
 	}
 
-	// Use shared OpenAI-compatible streaming logic
+	// Use shared OpenAI-compatible streaming logic (with reasoning field support)
 	return handleOpenAIStreaming(
 		ctx,
 		provider.streamClient,
@@ -331,4 +329,43 @@ func (provider *OpenRouterProvider) Transcription(ctx context.Context, model str
 
 func (provider *OpenRouterProvider) TranscriptionStream(ctx context.Context, postHookRunner schemas.PostHookRunner, model string, key schemas.Key, input *schemas.TranscriptionInput, params *schemas.ModelParameters) (chan *schemas.BifrostStream, *schemas.BifrostError) {
 	return nil, newUnsupportedOperationError("transcription stream", "openrouter")
+}
+
+// parseResponseWithReasoningFields parses response body and maps reasoning_content/reasoning to thought
+func parseResponseWithReasoningFields(responseBody []byte, providerName schemas.ModelProvider) (map[string]interface{}, *schemas.BifrostResponse, *schemas.BifrostError) {
+	// Parse as raw map to handle reasoning fields
+	var rawMap map[string]interface{}
+	if err := sonic.Unmarshal(responseBody, &rawMap); err != nil {
+		return nil, nil, newBifrostOperationError(schemas.ErrProviderResponseUnmarshal, err, providerName)
+	}
+
+	// Map reasoning_content/reasoning to thought in message
+	if choices, ok := rawMap["choices"].([]interface{}); ok {
+		for _, choice := range choices {
+			if choiceMap, ok := choice.(map[string]interface{}); ok {
+				if message, ok := choiceMap["message"].(map[string]interface{}); ok {
+					if rc, exists := message["reasoning_content"]; exists {
+						message["thought"] = rc
+						delete(message, "reasoning_content")
+					} else if r, exists := message["reasoning"]; exists {
+						message["thought"] = r
+						delete(message, "reasoning")
+					}
+				}
+			}
+		}
+	}
+
+	// Re-marshal and parse into BifrostResponse
+	modifiedBody, err := sonic.Marshal(rawMap)
+	if err != nil {
+		return nil, nil, newBifrostOperationError(schemas.ErrProviderJSONMarshaling, err, providerName)
+	}
+
+	response := &schemas.BifrostResponse{}
+	if err := sonic.Unmarshal(modifiedBody, response); err != nil {
+		return nil, nil, newBifrostOperationError(schemas.ErrProviderResponseUnmarshal, err, providerName)
+	}
+
+	return rawMap, response, nil
 }
